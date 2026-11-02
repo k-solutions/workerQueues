@@ -1,0 +1,105 @@
+cabal-version:      3.4
+name:               workerQueues
+version:            0.1.0.0
+synopsis:           High-performance Sidekiq-compatible Haskell worker queue library
+description:
+    Drop-in high-performance Haskell background job processing library for Ruby on Rails
+    (Sidekiq / ActiveJob) and YAML cron schedules, built on Warp's low-level optimisations,
+    64-byte zero-copy binary+JSON framing, two-stage swap-and-merge timeout management,
+    and the zero-cost WorkerM (ReaderT) handler pattern with Beam PostgreSQL & SQLite pools.
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             Hristo Kochev
+maintainer:         h.l.kochev@gmail.com
+category:           Concurrency
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+
+common warnings
+    ghc-options: -Wall -Wno-orphans -O2
+
+library
+    import:           warnings
+    exposed-modules:
+        WorkerQueue
+        WorkerQueue.Frame
+        WorkerQueue.Json
+        WorkerQueue.TimeoutManager
+        WorkerQueue.Sidekiq
+        WorkerQueue.Queue
+        WorkerQueue.Redis
+        WorkerQueue.Cron
+        WorkerQueue.Database
+        WorkerQueue.Metrics
+        WorkerQueue.Monad
+        WorkerQueue.Dispatcher
+        WorkerQueue.Engine
+        WorkerQueue.Worker
+    build-depends:
+        base                 >= 4.18 && < 5,
+        aeson                >= 2.1,
+        beam-core            >= 0.10,
+        beam-postgres        >= 0.5,
+        beam-sqlite          >= 0.5,
+        bytestring           >= 0.11,
+        containers           >= 0.6,
+        exceptions           >= 0.10,
+        hashable             >= 1.4,
+        mtl                  >= 2.3,
+        network              >= 3.1,
+        postgresql-simple    >= 0.7,
+        random               >= 1.2,
+        resource-pool        >= 0.4,
+        sqlite-simple        >= 0.4,
+        stm                  >= 2.5,
+        text                 >= 2.0,
+        time                 >= 1.12,
+        unordered-containers >= 0.2,
+        vector               >= 0.13,
+        yaml                 >= 0.11
+    hs-source-dirs:   src
+    default-language: GHC2024
+
+test-suite workerQueues-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        workerQueues,
+        aeson,
+        bytestring,
+        containers,
+        sqlite-simple,
+        stm,
+        tasty                >= 1.4,
+        tasty-hunit          >= 0.10,
+        tasty-quickcheck     >= 0.10,
+        text,
+        time,
+        unordered-containers
+    hs-source-dirs:   test
+    default-language: GHC2024
+
+benchmark workerQueues-bench
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          EndToEndBench.hs
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        workerQueues,
+        aeson,
+        beam-core,
+        beam-sqlite,
+        bytestring,
+        containers,
+        sqlite-simple,
+        stm,
+        text,
+        time,
+        unordered-containers,
+        vector
+    hs-source-dirs:   bench
+    default-language: GHC2024
