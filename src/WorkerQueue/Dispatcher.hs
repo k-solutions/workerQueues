@@ -1,6 +1,6 @@
-{-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE GHC2024            #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 module WorkerQueue.Dispatcher
   ( -- * Capability-Aware Dispatcher & JSON Parameter Cache
@@ -17,32 +17,30 @@ module WorkerQueue.Dispatcher
   , dispatchZeroCopy
   ) where
 
-import Control.Exception (throwIO)
-import Control.Monad.IO.Class (liftIO)
-import Data.Bits ((.&.))
-import Data.ByteString (ByteString)
-import Data.HashMap.Strict (HashMap)
-import Data.HashMap.Strict qualified as HM
-import Data.HashSet (HashSet)
-import Data.HashSet qualified as HS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, writeIORef)
-import Data.Proxy (Proxy (..))
-import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
-import Data.Vector (Vector)
-import Data.Vector qualified as V
-import Data.Word (Word64)
-import System.IO.Unsafe (unsafePerformIO)
-import WorkerQueue.Frame (JobHeader (..), JobPayload (..))
-import WorkerQueue.Json
-  ( JsonCacheStats (..)
-  , JsonParamCache
-  , decodeWithParamCache
-  , getJsonCacheStats
-  , lookupPrewarmedOrDecode
-  , newJsonParamCache
-  )
-import WorkerQueue.Monad (JobHandler, WorkerM)
+import           Control.Exception      (throwIO)
+import           Control.Monad.IO.Class (liftIO)
+import           Data.Bits              ((.&.))
+import           Data.ByteString        (ByteString)
+import           Data.HashMap.Strict    (HashMap)
+import qualified Data.HashMap.Strict    as HM
+import           Data.HashSet           (HashSet)
+import qualified Data.HashSet           as HS
+import           Data.IORef             (IORef, atomicModifyIORef', newIORef,
+                                         writeIORef)
+import           Data.Proxy             (Proxy (..))
+import qualified Data.Text              as T
+import qualified Data.Text.Encoding     as TE
+import           Data.Vector            (Vector)
+import qualified Data.Vector            as V
+import           Data.Word              (Word64)
+import           System.IO.Unsafe       (unsafePerformIO)
+import           WorkerQueue.Frame      (Header (..), JobPayload (..))
+import           WorkerQueue.Json       (JsonCacheStats (..), JsonParamCache,
+                                         decodeWithParamCache,
+                                         getJsonCacheStats,
+                                         lookupPrewarmedOrDecode,
+                                         newJsonParamCache)
+import           WorkerQueue.Monad      (JobHandler, WorkerM)
 
 readyRingSize :: Int
 readyRingSize = 16_384
@@ -74,7 +72,7 @@ data Dispatcher ctx = Dispatcher
 registerWorker :: forall a ctx. JobPayload a => JobHandler ctx a -> HandlerRegistration ctx
 registerWorker handler =
   let !tag = jobClassTag (Proxy @a)
-   in HandlerRegistration
+  in HandlerRegistration
         { hrClassTag = tag
         , hrBuild    = do
             cache <- newJsonParamCache 16_384 :: IO (JsonParamCache a)
@@ -146,9 +144,9 @@ prewarmSlice disp !jId clsSlice argsSlice =
     Nothing -> pure ()
 {-# INLINE prewarmSlice #-}
 
--- | Route a decoded `JobHeader` and its zero-copy `payloadSlice` to the matching `WorkerM ctx` handler.
+-- | Route a decoded `Header` and its zero-copy `payloadSlice` to the matching `WorkerM ctx` handler.
 -- First checks and consumes the O(1) `dispReadyRing` slot populated by the Dedicated JSON Processing Worker pool!
-dispatchZeroCopy :: Dispatcher ctx -> JobHeader -> ByteString -> WorkerM ctx ()
+dispatchZeroCopy :: Dispatcher ctx -> Header -> ByteString -> WorkerM ctx ()
 dispatchZeroCopy disp hdr payloadSlice = do
   let !jId = hdrJobId hdr
   if jId > 0

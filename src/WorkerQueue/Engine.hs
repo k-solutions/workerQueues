@@ -1,17 +1,29 @@
 {-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module WorkerQueue.Engine
-  ( -- * Engine Configuration & Worker Execution
+  ( -- * Engine Configuration & `ReaderT` Monad (`EngineM ctx`)
     EngineConfig (..)
   , defaultEngineConfig
+  , EngineParams (..)
+  , EngineEnv (..)
+  , EngineM
+  , runEngineM
+  , askWorkerEnv
+  , askDispatcher
+  , flushEngineRedisSync
   , WorkerEngineHandle (..)
+
+    -- * Worker Execution & Batch Ingestion (`EngineM ctx`)
   , claimRawRedisBatch
   , ingestRawSidekiqBatch
   , fetchAndIngestRedisBatch
   , processFrameWithTimeout
   , handleRetryOrDLQ
+
+    -- * Engine Lifecycle
   , startWorkerEngine
   , stopWorkerEngine
   , withWorkerEngine
@@ -27,6 +39,8 @@ import Control.Concurrent.STM
   )
 import Control.Exception (SomeException, bracket, displayException, fromException, try)
 import Control.Monad (replicateM, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ReaderT (..), ask, asks)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (catMaybes)
@@ -42,9 +56,9 @@ import WorkerQueue.Dispatcher
   , prewarmSlice
   )
 import WorkerQueue.Frame
-  ( JobHeader (..)
-  , bumpFrameRetry
-  , decodeHeaderZeroCopy
+  ( Header (..)
+  , bumpRetry
+  , decodeHeader
   )
 import WorkerQueue.Metrics
   ( Logger
@@ -69,9 +83,11 @@ import WorkerQueue.Queue
   , newMultiPriorityQueue
   )
 import WorkerQueue.Redis
-  ( RedisStore
+  ( ClaimBatchParams (..)
+  , RedisStore
   , acknowledgeJobAsync
   , claimExecutableBatch
+  , flushRedisSyncNow
   , promoteDueZSetJobs
   , rshStore
   , scheduleRetryAsync
@@ -117,6 +133,43 @@ defaultEngineConfig = EngineConfig
   , cfgQueues              = ["critical", "default", "low"]
   }
 
+-- | Parameters for starting and running the worker engine.
+data EngineParams ctx = EngineParams
+  { epConfig     :: !EngineConfig
+  , epRedisStore :: !RedisStore
+  , epDbPools    :: !DbPools
+  , epLogger     :: !Logger
+  , epMetrics    :: !Metrics
+  , epAppContext :: !ctx
+  , epDispatcher :: !(Dispatcher ctx)
+  }
+
+-- | Shared environment for `EngineM ctx` combining `WorkerEnv ctx` and `Dispatcher ctx`.
+data EngineEnv ctx = EngineEnv
+  { eeEnv        :: !(WorkerEnv ctx)
+  , eeDispatcher :: !(Dispatcher ctx)
+  }
+
+type EngineM ctx = ReaderT (EngineEnv ctx) IO
+
+runEngineM :: EngineEnv ctx -> EngineM ctx a -> IO a
+runEngineM env action = runReaderT action env
+{-# INLINE runEngineM #-}
+
+askWorkerEnv :: EngineM ctx (WorkerEnv ctx)
+askWorkerEnv = asks eeEnv
+{-# INLINE askWorkerEnv #-}
+
+askDispatcher :: EngineM ctx (Dispatcher ctx)
+askDispatcher = asks eeDispatcher
+{-# INLINE askDispatcher #-}
+
+flushEngineRedisSync :: EngineM ctx ()
+flushEngineRedisSync = do
+  syncHdl <- asks (envRedisSync . eeEnv)
+  liftIO (flushRedisSyncNow syncHdl)
+{-# INLINE flushEngineRedisSync #-}
+
 data WorkerEngineHandle ctx = WorkerEngineHandle
   { wehEnv           :: !(WorkerEnv ctx)
   , wehDispatcher    :: !(Dispatcher ctx)
@@ -126,228 +179,212 @@ data WorkerEngineHandle ctx = WorkerEngineHandle
   }
 
 -- | Claim a batch of executable raw Sidekiq JSON strings from Redis queues and ZSETs.
-claimRawRedisBatch
-  :: WorkerEnv ctx
-  -> Dispatcher ctx
-  -> [ByteString]
-  -> Int
-  -> IO [ByteString]
-claimRawRedisBatch env disp queues batchSz = do
-  let store   = rshStore (envRedisSync env)
-      allowed = dispClassSet disp
-      metrics = envMetrics env
+claimRawRedisBatch :: [ByteString] -> Int -> EngineM ctx [ByteString]
+claimRawRedisBatch queues batchSz = do
+  EngineEnv {..} <- ask
+  liftIO $ do
+    let store   = rshStore (envRedisSync eeEnv)
+        allowed = dispClassSet eeDispatcher
+        metrics = envMetrics eeEnv
 
-  nowSec      <- realToFrac <$> getPOSIXTime
-  promotedRaw <- promoteDueZSetJobs store allowed nowSec
+    nowSec      <- realToFrac <$> getPOSIXTime
+    promotedRaw <- promoteDueZSetJobs store allowed nowSec
 
-  claimedPerQ <- mapM
-    (\qName -> claimExecutableBatch store metrics allowed qName batchSz)
-    queues
+    claimedPerQ <- mapM
+      (\qName ->
+        claimExecutableBatch ClaimBatchParams
+          { cbpStore          = store
+          , cbpMetrics        = metrics
+          , cbpAllowedClasses = allowed
+          , cbpQueueName      = qName
+          , cbpMaxClaim       = batchSz
+          }
+      )
+      queues
 
-  pure (promotedRaw ++ concat claimedPerQ)
+    pure (promotedRaw ++ concat claimedPerQ)
 
 -- | Executed by the Dedicated JSON Processing Workers:
 -- 1. Zero-copy scans each raw Sidekiq JSON envelope into a 64-byte Hybrid Frame.
 -- 2. Pre-decodes/caches the JSON parameters in `Dispatcher`'s Two-Level `JsonParamCache`
 --    and binds the ready handler closure in `dispReadyRing`.
 -- 3. Enqueues the entire batch of frames into `MultiPriorityQueue` in a single STM transaction!
-ingestRawSidekiqBatch
-  :: WorkerEnv ctx
-  -> Dispatcher ctx
-  -> [ByteString]
-  -> IO Int
-ingestRawSidekiqBatch _   _    []          = pure 0
-ingestRawSidekiqBatch env disp rawJsonList = do
-  nowNs <- fromIntegral <$> getMonotonicTimeNSec
-  let !batchLen = length rawJsonList
-  baseJobId <- atomicModifyIORef' (envJobCounter env) (\n -> (n + fromIntegral batchLen, n + 1))
+ingestRawSidekiqBatch :: [ByteString] -> EngineM ctx Int
+ingestRawSidekiqBatch []          = pure 0
+ingestRawSidekiqBatch rawJsonList = do
+  EngineEnv {..} <- ask
+  liftIO $ do
+    nowNs <- fromIntegral <$> getMonotonicTimeNSec
+    let !batchLen = length rawJsonList
+    baseJobId <- atomicModifyIORef' (envJobCounter eeEnv) (\n -> (n + fromIntegral batchLen, n + 1))
 
-  mFrames <- mapM
-    (\(offset, rawJson) -> do
-      let !jId = baseJobId + offset
-      case sidekiqEnvelopeToFrameWithSlices jId nowNs rawJson of
-        Right (prio, clsSlice, argsSlice, frame) -> do
-          prewarmSlice disp jId clsSlice argsSlice
-          pure (Just (prio, frame))
-        Left err -> do
-          logWarnIO (envLogger env) ("Skipping malformed Sidekiq JSON: " <> T.pack err)
-          pure Nothing
-    )
-    (zip [0 ..] rawJsonList)
+    mFrames <- mapM
+      (\(offset, rawJson) -> do
+        let !jId = baseJobId + offset
+        case sidekiqEnvelopeToFrameWithSlices jId nowNs rawJson of
+          Right (prio, clsSlice, argsSlice, frame) -> do
+            prewarmSlice eeDispatcher jId clsSlice argsSlice
+            pure (Just (prio, frame))
+          Left err -> do
+            logWarnIO (envLogger eeEnv) ("Skipping malformed Sidekiq JSON: " <> T.pack err)
+            pure Nothing
+      )
+      (zip [0 ..] rawJsonList)
 
-  let validFrames = catMaybes mFrames
-      !validCount = length validFrames
-  when (validCount > 0) $ do
-    enqueuePriorityFramesBatch (envQueue env) validFrames
-    incEnqueued (envMetrics env) (fromIntegral validCount)
-  pure validCount
+    let validFrames = catMaybes mFrames
+        !validCount = length validFrames
+    when (validCount > 0) $ do
+      enqueuePriorityFramesBatch (envQueue eeEnv) validFrames
+      incEnqueued (envMetrics eeEnv) (fromIntegral validCount)
+    pure validCount
 
--- | Direct synchronous claim + ingest helper.
-fetchAndIngestRedisBatch
-  :: WorkerEnv ctx
-  -> Dispatcher ctx
-  -> [ByteString]
-  -> Int
-  -> IO Int
-fetchAndIngestRedisBatch env disp queues batchSz = do
-  rawBatch <- claimRawRedisBatch env disp queues batchSz
-  ingestRawSidekiqBatch env disp rawBatch
+-- | Direct synchronous claim + ingest helper in `EngineM ctx`.
+fetchAndIngestRedisBatch :: [ByteString] -> Int -> EngineM ctx Int
+fetchAndIngestRedisBatch queues batchSz = do
+  rawBatch <- claimRawRedisBatch queues batchSz
+  ingestRawSidekiqBatch rawBatch
 
 -- | Execute a single 64-byte job frame with `bracket` lease registration,
 -- zero-cost `ReaderT` handler execution, and automatic Sidekiq Retry/DLQ recovery.
-processFrameWithTimeout
-  :: WorkerEnv ctx
-  -> Dispatcher ctx
-  -> ByteString
-  -> IO ()
-processFrameWithTimeout env disp rawFrame =
-  case decodeHeaderZeroCopy rawFrame of
-    Left err ->
-      logErrorIO (envLogger env) ("Invalid binary frame in queue: " <> T.pack err)
-    Right hdr -> do
-      recoveredRef <- newIORef False
-      let onLeaseExpired = do
-            already <- atomicModifyIORef' recoveredRef (True,)
-            when (not already) $ do
-              incHardKilled (envMetrics env)
-              handleRetryOrDLQ env rawFrame (Just "JobLeaseExpired (Stage-2 Hard Kill)")
+processFrameWithTimeout :: ByteString -> EngineM ctx ()
+processFrameWithTimeout rawFrame = do
+  eenv@(EngineEnv {..}) <- ask
+  liftIO $
+    case decodeHeader rawFrame of
+      Left err ->
+        logErrorIO (envLogger eeEnv) ("Invalid binary frame in queue: " <> T.pack err)
+      Right hdr -> do
+        recoveredRef <- newIORef False
+        let onLeaseExpired = do
+              already <- atomicModifyIORef' recoveredRef (True,)
+              when (not already) $ do
+                incHardKilled (envMetrics eeEnv)
+                runEngineM eenv (handleRetryOrDLQ rawFrame (Just "JobLeaseExpired (Stage-2 Hard Kill)"))
 
-      bracket
-        (registerJob
-          (envTimeoutMgr env)
-          (hdrJobId hdr)
-          (hdrSidekiqJid hdr)
-          (hdrTagSlice hdr)
-          onLeaseExpired)
-        unregisterJob
-        (\ticket -> do
-          let jctx = JobContext
-                { jcEnv    = env
-                , jcTicket = ticket
-                , jcHeader = hdr
-                }
-          res <- try (runWorkerM jctx (dispatchZeroCopy disp hdr (hdrPayloadSlice hdr)))
-          case res of
-            Right () -> do
-              alreadyExpired <- readIORef recoveredRef
-              when (not alreadyExpired) $ do
-                nowNs <- fromIntegral <$> getMonotonicTimeNSec
-                let durNs = nowNs - hdrCreatedAtNs hdr
-                recordJobLatencyNs (envMetrics env) (hdrPriority hdr) durNs
-                incCompleted (envMetrics env)
-                acknowledgeJobAsync (envRedisSync env) (hdrSidekiqJid hdr)
-            Left (ex :: SomeException) ->
-              case fromException ex of
-                Just (_ :: JobLeaseExpired) ->
-                  -- Recovery already triggered by `onLeaseExpired` inside `triggerHardKill`
-                  pure ()
-                Nothing -> do
-                  alreadyExpired <- atomicModifyIORef' recoveredRef (True,)
-                  when (not alreadyExpired) $
-                    handleRetryOrDLQ env rawFrame (Just (T.pack (displayException ex)))
-        )
+        bracket
+          (registerJob
+            (envTimeoutMgr eeEnv)
+            (hdrJobId hdr)
+            (hdrSidekiqJid hdr)
+            (hdrTagSlice hdr)
+            onLeaseExpired)
+          unregisterJob
+          (\ticket -> do
+            let jctx = JobContext
+                  { jcEnv    = eeEnv
+                  , jcTicket = ticket
+                  , jcHeader = hdr
+                  }
+            res <- try (runWorkerM jctx (dispatchZeroCopy eeDispatcher hdr (hdrPayloadSlice hdr)))
+            case res of
+              Right () -> do
+                alreadyExpired <- readIORef recoveredRef
+                when (not alreadyExpired) $ do
+                  nowNs <- fromIntegral <$> getMonotonicTimeNSec
+                  let durNs = nowNs - hdrCreatedAtNs hdr
+                  recordJobLatencyNs (envMetrics eeEnv) (hdrPriority hdr) durNs
+                  incCompleted (envMetrics eeEnv)
+                  acknowledgeJobAsync (envRedisSync eeEnv) (hdrSidekiqJid hdr)
+              Left (ex :: SomeException) ->
+                case fromException ex of
+                  Just (_ :: JobLeaseExpired) ->
+                    -- Recovery already triggered by `onLeaseExpired` inside `triggerHardKill`
+                    pure ()
+                  Nothing -> do
+                    alreadyExpired <- atomicModifyIORef' recoveredRef (True,)
+                    when (not alreadyExpired) $
+                      runEngineM eenv (handleRetryOrDLQ rawFrame (Just (T.pack (displayException ex))))
+          )
 {-# INLINE processFrameWithTimeout #-}
 
 -- | Increment `retryCount` and either schedule exponential backoff in Redis `retry` ZSET
 -- or route the job to the Redis `dead` (DLQ) ZSET if `retryCount > maxRetries`.
-handleRetryOrDLQ :: WorkerEnv ctx -> ByteString -> Maybe Text -> IO ()
-handleRetryOrDLQ env rawFrame mErrMsg =
-  case bumpFrameRetry rawFrame of
-    Left err ->
-      logErrorIO (envLogger env) ("handleRetryOrDLQ failed: " <> T.pack err)
-    Right (nextRetry, maxRet, bumpedFrame) -> do
-      nowSec <- realToFrac <$> getPOSIXTime
-      let jid = case decodeHeaderZeroCopy bumpedFrame of
-                  Right h -> hdrSidekiqJid h
-                  Left _  -> "000000000000000000000000"
-      case frameToSidekiqJson bumpedFrame mErrMsg of
-        Left err ->
-          logErrorIO (envLogger env) ("frameToSidekiqJson failed: " <> T.pack err)
-        Right skJson ->
-          if nextRetry <= maxRet
-            then do
-              backoffSec <- computeSidekiqBackoffSecs nextRetry
-              let nextRunAt = nowSec + backoffSec
-              incRetried (envMetrics env)
-              scheduleRetryAsync (envRedisSync env) jid nextRunAt skJson
-            else do
-              incDeadLettered (envMetrics env)
-              sendToDlqAsync (envRedisSync env) jid nowSec skJson
+handleRetryOrDLQ :: ByteString -> Maybe Text -> EngineM ctx ()
+handleRetryOrDLQ rawFrame mErrMsg = do
+  env <- askWorkerEnv
+  liftIO $
+    case bumpRetry rawFrame of
+      Left err ->
+        logErrorIO (envLogger env) ("handleRetryOrDLQ failed: " <> T.pack err)
+      Right (nextRetry, maxRet, bumpedFrame) -> do
+        nowSec <- realToFrac <$> getPOSIXTime
+        let jid = case decodeHeader bumpedFrame of
+                    Right h -> hdrSidekiqJid h
+                    Left _  -> "000000000000000000000000"
+        case frameToSidekiqJson bumpedFrame mErrMsg of
+          Left err ->
+            logErrorIO (envLogger env) ("frameToSidekiqJson failed: " <> T.pack err)
+          Right skJson ->
+            if nextRetry <= maxRet
+              then do
+                backoffSec <- computeSidekiqBackoffSecs nextRetry
+                let nextRunAt = nowSec + backoffSec
+                incRetried (envMetrics env)
+                scheduleRetryAsync (envRedisSync env) jid nextRunAt skJson
+              else do
+                incDeadLettered (envMetrics env)
+                sendToDlqAsync (envRedisSync env) jid nowSec skJson
 
 -- | Continuous execution worker loop running `WorkerM ctx` handlers.
-workerLoop :: WorkerEnv ctx -> Dispatcher ctx -> IO ()
-workerLoop env disp = go
+workerLoop :: EngineM ctx ()
+workerLoop = do
+  q <- asks (envQueue . eeEnv)
+  go q
   where
-    go = do
-      rawFrame <- dequeueWeighted (envQueue env)
-      processFrameWithTimeout env disp rawFrame
-      go
+    go q = do
+      rawFrame <- liftIO (dequeueWeighted q)
+      processFrameWithTimeout rawFrame
+      go q
 
 -- | Dedicated JSON Processing Worker Loop:
 -- Pulls raw claimed Sidekiq JSON batches from `rawJsonQueue`, slices them into
 -- 64-byte frames, pre-decodes/caches JSON parameters in `JsonParamCache`,
 -- and batch-enqueues ready frames into `MultiPriorityQueue`.
-jsonProcessorWorkerLoop
-  :: WorkerEnv ctx
-  -> Dispatcher ctx
-  -> TBQueue [ByteString]
-  -> IO ()
-jsonProcessorWorkerLoop env disp rawJsonQueue = go
+jsonProcessorWorkerLoop :: TBQueue [ByteString] -> EngineM ctx ()
+jsonProcessorWorkerLoop rawJsonQueue = go
   where
     go = do
-      rawBatch <- atomically (readTBQueue rawJsonQueue)
-      _ <- ingestRawSidekiqBatch env disp rawBatch
+      rawBatch <- liftIO $ atomically (readTBQueue rawJsonQueue)
+      _ <- ingestRawSidekiqBatch rawBatch
       go
 
 -- | Continuous background fetcher loop claiming executable raw batches from Redis/Valkey
 -- and handing them off to the Dedicated JSON Processing Worker Pool.
-fetcherLoop
-  :: EngineConfig
-  -> WorkerEnv ctx
-  -> Dispatcher ctx
-  -> TBQueue [ByteString]
-  -> IO ()
-fetcherLoop cfg env disp rawJsonQueue = go
+fetcherLoop :: EngineConfig -> TBQueue [ByteString] -> EngineM ctx ()
+fetcherLoop cfg rawJsonQueue = go
   where
     go = do
-      rawBatch <- claimRawRedisBatch env disp (cfgQueues cfg) (cfgFetchBatchSize cfg)
+      rawBatch <- claimRawRedisBatch (cfgQueues cfg) (cfgFetchBatchSize cfg)
       if null rawBatch
-        then threadDelay (cfgPollIntervalMicros cfg)
-        else atomically (writeTBQueue rawJsonQueue rawBatch)
+        then liftIO $ threadDelay (cfgPollIntervalMicros cfg)
+        else liftIO $ atomically (writeTBQueue rawJsonQueue rawBatch)
       go
 
-startWorkerEngine
-  :: EngineConfig
-  -> RedisStore
-  -> DbPools
-  -> Logger
-  -> Metrics
-  -> ctx
-  -> Dispatcher ctx
-  -> IO (WorkerEngineHandle ctx)
-startWorkerEngine cfg store dbPools logger metrics appCtx disp = do
-  tm           <- startTimeoutManager (cfgLeaseTimeoutSecs cfg) (cfgGracePeriodSecs cfg) (cfgSweepIntervalMicros cfg)
-  redisSync    <- startRedisSyncEngine store
-  mpq          <- newMultiPriorityQueue (cfgQueueCapacity cfg)
+startWorkerEngine :: EngineParams ctx -> IO (WorkerEngineHandle ctx)
+startWorkerEngine EngineParams {..} = do
+  tm           <- startTimeoutManager (cfgLeaseTimeoutSecs epConfig) (cfgGracePeriodSecs epConfig) (cfgSweepIntervalMicros epConfig)
+  redisSync    <- startRedisSyncEngine epRedisStore
+  mpq          <- newMultiPriorityQueue (cfgQueueCapacity epConfig)
   rawJsonQueue <- newTBQueueIO 1_024
   jCounter     <- newIORef 0
   let env = WorkerEnv
-        { envLogger     = logger
-        , envMetrics    = metrics
-        , envDbPools    = dbPools
+        { envLogger     = epLogger
+        , envMetrics    = epMetrics
+        , envDbPools    = epDbPools
         , envTimeoutMgr = tm
         , envRedisSync  = redisSync
         , envQueue      = mpq
         , envJobCounter = jCounter
-        , envAppContext = appCtx
+        , envAppContext = epAppContext
         }
-      nJsonWorkers = max 1 (cfgJsonWorkerCount cfg)
-  fetcherTid <- forkIO (fetcherLoop cfg env disp rawJsonQueue)
-  jsonTids   <- replicateM nJsonWorkers (forkIO (jsonProcessorWorkerLoop env disp rawJsonQueue))
-  workerTids <- replicateM (cfgWorkerCount cfg) (forkIO (workerLoop env disp))
+      eenv         = EngineEnv env epDispatcher
+      nJsonWorkers = max 1 (cfgJsonWorkerCount epConfig)
+  fetcherTid <- forkIO (runEngineM eenv (fetcherLoop epConfig rawJsonQueue))
+  jsonTids   <- replicateM nJsonWorkers (forkIO (runEngineM eenv (jsonProcessorWorkerLoop rawJsonQueue)))
+  workerTids <- replicateM (cfgWorkerCount epConfig) (forkIO (runEngineM eenv workerLoop))
   pure WorkerEngineHandle
     { wehEnv           = env
-    , wehDispatcher    = disp
+    , wehDispatcher    = epDispatcher
     , wehWorkerThreads = workerTids
     , wehJsonThreads   = jsonTids
     , wehFetcherThread = fetcherTid
@@ -361,17 +398,9 @@ stopWorkerEngine hdl = do
   stopTimeoutManager (envTimeoutMgr (wehEnv hdl))
   stopRedisSyncEngine (envRedisSync (wehEnv hdl))
 
-withWorkerEngine
-  :: EngineConfig
-  -> RedisStore
-  -> DbPools
-  -> Logger
-  -> Metrics
-  -> ctx
-  -> Dispatcher ctx
-  -> (WorkerEngineHandle ctx -> IO a)
-  -> IO a
-withWorkerEngine cfg store dbPools logger metrics appCtx disp =
+withWorkerEngine :: EngineParams ctx -> EngineM ctx a -> IO a
+withWorkerEngine params action =
   bracket
-    (startWorkerEngine cfg store dbPools logger metrics appCtx disp)
+    (startWorkerEngine params)
     stopWorkerEngine
+    (\hdl -> runEngineM (EngineEnv (wehEnv hdl) (wehDispatcher hdl)) action)

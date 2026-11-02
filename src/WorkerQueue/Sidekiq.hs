@@ -28,10 +28,10 @@ import qualified Data.Text.Encoding   as TE
 import qualified Data.Vector          as V
 import           Data.Word            (Word16, Word64)
 import           System.Random        (randomRIO)
-import           WorkerQueue.Frame    (FrameSource (..), JobHeader (..),
-                                       JobPayload (..), Priority,
-                                       decodeHeaderZeroCopy, encodeFrame,
-                                       parseQueuePriority, priorityToQueueName)
+import           WorkerQueue.Frame    (Header (..), JobPayload (..),
+                                       Params (..), Priority, Source (..),
+                                       decodeHeader, encode, parsePriority,
+                                       toQueueName)
 import           WorkerQueue.Json     (FastSidekiqScan (..),
                                        scanSidekiqClassFast,
                                        scanSidekiqEnvelopeFast)
@@ -120,39 +120,41 @@ sidekiqEnvelopeToFrameWithSlices
 sidekiqEnvelopeToFrameWithSlices !jId !fallbackNowNs rawJson =
   case scanSidekiqEnvelopeFast rawJson of
     Just fss ->
-      let !prio      = parseQueuePriority (fssQueue fss)
+      let !prio      = parsePriority (fssQueue fss)
           !createdNs = if fssCreatedNs fss > 0 then fssCreatedNs fss else fallbackNowNs
           !clsSlice  = fssClass fss
           !argsSlice = fssArgsSlice fss
-          !frame     = encodeFrame
-            prio
-            SourceRails
-            (fssRetryCount fss)
-            (fssMaxRetries fss)
-            jId
-            (fssJid fss)
-            createdNs
-            (fssQueue fss)
-            clsSlice
-            argsSlice
+          !frame     = encode Params
+            { fpPriority     = prio
+            , fpSource       = SourceRails
+            , fpRetryCount   = fssRetryCount fss
+            , fpMaxRetries   = fssMaxRetries fss
+            , fpJobId        = jId
+            , fpSidekiqJid   = fssJid fss
+            , fpCreatedAtNs  = createdNs
+            , fpQueueSlice   = fssQueue fss
+            , fpTagSlice     = clsSlice
+            , fpPayloadSlice = argsSlice
+            }
        in Right (prio, clsSlice, argsSlice, frame)
     Nothing -> do
       env <- parseSidekiqEnvelope rawJson
-      let !prio      = parseQueuePriority (skQueue env)
+      let !prio      = parsePriority (skQueue env)
           !createdNs = if skCreatedNs env > 0 then skCreatedNs env else fallbackNowNs
           !clsSlice  = skClass env
           !argsSlice = skArgsBytes env
-          !frame     = encodeFrame
-            prio
-            SourceRails
-            (skRetryCount env)
-            (skMaxRetries env)
-            jId
-            (skJid env)
-            createdNs
-            (skQueue env)
-            clsSlice
-            argsSlice
+          !frame     = encode Params
+            { fpPriority     = prio
+            , fpSource       = SourceRails
+            , fpRetryCount   = skRetryCount env
+            , fpMaxRetries   = skMaxRetries env
+            , fpJobId        = jId
+            , fpSidekiqJid   = skJid env
+            , fpCreatedAtNs  = createdNs
+            , fpQueueSlice   = skQueue env
+            , fpTagSlice     = clsSlice
+            , fpPayloadSlice = argsSlice
+            }
       Right (prio, clsSlice, argsSlice, frame)
 {-# INLINE sidekiqEnvelopeToFrameWithSlices #-}
 
@@ -174,7 +176,7 @@ sidekiqEnvelopeToFrame !jId !fallbackNowNs rawJson =
 -- for storing in Redis `retry` or `dead` (DLQ) sorted sets.
 frameToSidekiqJson :: ByteString -> Maybe Text -> Either String ByteString
 frameToSidekiqJson rawFrame mErrMsg = do
-  hdr <- decodeHeaderZeroCopy rawFrame
+  hdr <- decodeHeader rawFrame
   let argsVal = case Aeson.decodeStrict' (hdrPayloadSlice hdr) of
                   Just v  -> Array (V.singleton v)
                   Nothing -> Array V.empty
@@ -204,7 +206,7 @@ encodeSidekiqJobJson
   -> ByteString
 encodeSidekiqJobJson prio jid maxRet createdNs payload =
   let clsName = TE.decodeUtf8Lenient (jobClassTag (Proxy @a))
-      qName   = TE.decodeUtf8Lenient (priorityToQueueName prio)
+      qName   = TE.decodeUtf8Lenient (toQueueName prio)
   in BSL.toStrict $ Aeson.encode $ object
         [ "class"      .= clsName
         , "jid"        .= TE.decodeUtf8Lenient jid

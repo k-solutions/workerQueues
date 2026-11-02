@@ -1,6 +1,4 @@
 {-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NumericUnderscores #-}
 
 module WorkerQueue.Queue
   ( MultiPriorityQueue (..)
@@ -16,23 +14,17 @@ module WorkerQueue.Queue
   , isQueueEmpty
   ) where
 
-import Control.Applicative ((<|>))
-import Control.Concurrent.STM
-  ( STM
-  , TBQueue
-  , atomically
-  , isEmptyTBQueue
-  , isFullTBQueue
-  , lengthTBQueue
-  , newTBQueueIO
-  , readTBQueue
-  , writeTBQueue
-  )
-import Data.ByteString (ByteString)
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
-import Data.Word (Word64)
-import Numeric.Natural (Natural)
-import WorkerQueue.Frame (Priority (..), decodeHeaderZeroCopy, hdrPriority)
+import           Control.Applicative    ((<|>))
+import           Control.Concurrent.STM (STM, TBQueue, atomically,
+                                         isEmptyTBQueue, isFullTBQueue,
+                                         lengthTBQueue, newTBQueueIO,
+                                         readTBQueue, writeTBQueue)
+import           Data.ByteString        (ByteString)
+import           Data.IORef             (IORef, atomicModifyIORef', newIORef)
+import           Data.Word              (Word64)
+import           Numeric.Natural        (Natural)
+import           WorkerQueue.Frame      (Priority (..), decodeHeader,
+                                         hdrPriority)
 
 -- | Multi-priority in-memory bounded STM queues for 64-byte hybrid frames.
 data MultiPriorityQueue = MultiPriorityQueue
@@ -71,7 +63,7 @@ selectQueue mpq Low      = qLow mpq
 -- | Enqueue a 64-byte binary frame into its priority TBQueue (blocks if full).
 enqueueFrame :: MultiPriorityQueue -> ByteString -> IO ()
 enqueueFrame mpq rawFrame = do
-  let !prio = case decodeHeaderZeroCopy rawFrame of
+  let !prio = case decodeHeader rawFrame of
                 Right hdr -> hdrPriority hdr
                 Left _    -> Default
   atomically $ writeTBQueue (selectQueue mpq prio) rawFrame
@@ -91,7 +83,7 @@ enqueueFramesBatch :: MultiPriorityQueue -> [ByteString] -> IO ()
 enqueueFramesBatch _   []     = pure ()
 enqueueFramesBatch mpq frames = do
   let tagged =
-        [ ( case decodeHeaderZeroCopy f of
+        [ ( case decodeHeader f of
               Right hdr -> hdrPriority hdr
               Left _    -> Default
           , f
@@ -104,7 +96,7 @@ enqueueFramesBatch mpq frames = do
 -- | Non-blocking enqueue; returns False if the target priority TBQueue is full.
 tryEnqueueFrame :: MultiPriorityQueue -> ByteString -> IO Bool
 tryEnqueueFrame mpq rawFrame = do
-  let !prio = case decodeHeaderZeroCopy rawFrame of
+  let !prio = case decodeHeader rawFrame of
                 Right hdr -> hdrPriority hdr
                 Left _    -> Default
       !q    = selectQueue mpq prio

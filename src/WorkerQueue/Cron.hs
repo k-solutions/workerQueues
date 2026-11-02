@@ -1,6 +1,6 @@
-{-# LANGUAGE GHC2024 #-}
+{-# LANGUAGE GHC2024           #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 -- | Built-in YAML Cron Scheduler (`config/schedule.yml`).
 -- Intended to be imported qualified:
@@ -13,6 +13,10 @@ module WorkerQueue.Cron
   , Expr (..)
   , JobSpec (..)
   , ScheduleFile (..)
+  , Env (..)
+  , CronM
+  , runCronM
+  , fromWorkerEnv
   , parseExpr
   , matchesTime
   , parseScheduleYaml
@@ -21,39 +25,43 @@ module WorkerQueue.Cron
   , executeTick
   ) where
 
-import Data.Aeson (FromJSON (..), Value (..), object, withObject, (.!=), (.:), (.:?))
-import Data.Aeson qualified as Aeson
-import Data.Aeson.Types (Parser)
-import Data.ByteString (ByteString)
-import Data.ByteString.Char8 qualified as B8
-import Data.ByteString.Lazy qualified as BSL
-import Data.Foldable (for_)
-import Data.HashSet (HashSet)
-import Data.HashSet qualified as HS
-import Data.IORef (IORef, atomicModifyIORef')
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
-import Data.Time.Calendar (toGregorian)
-import Data.Time.Calendar.WeekDate (toWeekDate)
-import Data.Time.Clock (UTCTime (..))
-import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
-import Data.Time.LocalTime (TimeOfDay (..), timeToTimeOfDay)
-import Data.Word (Word16, Word64)
-import Data.Yaml qualified as Yaml
-import GHC.Clock (getMonotonicTimeNSec)
-import Text.Read (readMaybe)
-import WorkerQueue.Frame
-  ( FrameSource (..)
-  , encodeFrame
-  , parseQueuePriority
-  )
-import WorkerQueue.Metrics (Metrics, incCronTriggered, incEnqueued)
-import WorkerQueue.Queue (MultiPriorityQueue, enqueueFrame)
-import WorkerQueue.Redis (RedisSyncHandle, acquireCronLock, recordWorkingLeaseAsync, rshStore)
-import WorkerQueue.Sidekiq (frameToSidekiqJson)
+import           Control.Monad               (filterM)
+import           Control.Monad.IO.Class      (liftIO)
+import           Control.Monad.Reader        (ReaderT (..), ask)
+import           Data.Aeson                  (FromJSON (..), Value (..), object,
+                                              withObject, (.!=), (.:), (.:?))
+import qualified Data.Aeson                  as Aeson
+import           Data.Aeson.Types            (Parser)
+import           Data.ByteString             (ByteString)
+import qualified Data.ByteString.Char8       as B8
+import qualified Data.ByteString.Lazy        as BSL
+import           Data.Foldable               (for_)
+import           Data.HashSet                (HashSet)
+import qualified Data.HashSet                as HS
+import           Data.IORef                  (IORef, atomicModifyIORef')
+import           Data.Map.Strict             (Map)
+import qualified Data.Map.Strict             as Map
+import           Data.Text                   (Text)
+import qualified Data.Text                   as T
+import qualified Data.Text.Encoding          as TE
+import           Data.Time.Calendar          (toGregorian)
+import           Data.Time.Calendar.WeekDate (toWeekDate)
+import           Data.Time.Clock             (UTCTime (..))
+import           Data.Time.Clock.POSIX       (utcTimeToPOSIXSeconds)
+import           Data.Time.LocalTime         (TimeOfDay (..), timeToTimeOfDay)
+import           Data.Word                   (Word16, Word64)
+import qualified Data.Yaml                   as Yaml
+import           GHC.Clock                   (getMonotonicTimeNSec)
+import           Text.Read                   (readMaybe)
+import qualified WorkerQueue.Frame           as Frame
+import           WorkerQueue.Metrics         (Metrics, incCronTriggered,
+                                              incEnqueued)
+import           WorkerQueue.Monad           (WorkerEnv (..))
+import           WorkerQueue.Queue           (MultiPriorityQueue, enqueueFrame)
+import           WorkerQueue.Redis           (RedisSyncHandle, acquireCronLock,
+                                              recordWorkingLeaseAsync, rshStore)
+import           WorkerQueue.Sidekiq         (frameToSidekiqJson)
+
 
 -- | Matcher for a single field in a 5-field cron expression.
 data Field
@@ -87,6 +95,32 @@ data JobSpec = JobSpec
 newtype ScheduleFile = ScheduleFile
   { sfJobs :: Map Text JobSpec
   } deriving (Show, Eq)
+
+-- | Runtime environment for the Cron scheduler (`ReaderT Env IO`).
+data Env = Env
+  { ceSpecs      :: ![JobSpec]
+  , ceRedisSync  :: !RedisSyncHandle
+  , ceQueue      :: !MultiPriorityQueue
+  , ceMetrics    :: !Metrics
+  , ceJobCounter :: !(IORef Word64)
+  }
+
+type CronM = ReaderT Env IO
+
+runCronM :: Env -> CronM a -> IO a
+runCronM env action = runReaderT action env
+{-# INLINE runCronM #-}
+
+-- | Build a Cron `Env` directly from validated `JobSpec`s and `WorkerEnv ctx`.
+fromWorkerEnv :: [JobSpec] -> WorkerEnv ctx -> Env
+fromWorkerEnv specs WorkerEnv {..} = Env
+  { ceSpecs      = specs
+  , ceRedisSync  = envRedisSync
+  , ceQueue      = envQueue
+  , ceMetrics    = envMetrics
+  , ceJobCounter = envJobCounter
+  }
+{-# INLINE fromWorkerEnv #-}
 
 instance FromJSON ScheduleFile where
   parseJSON = withObject "ScheduleFile" $ \root -> do
@@ -211,61 +245,46 @@ validateCapabilities allowedClasses (ScheduleFile jobsMap) =
       | otherwise =
           (execAcc, name : skipAcc)
 
--- | Execute a single cron evaluation tick for `nowUtc`:
+-- | Execute a single cron evaluation tick for `nowUtc` inside `ReaderT Env IO`:
 -- 1. Filters executable cron jobs matching `nowUtc`.
 -- 2. Attempts to acquire the distributed Redis lock `wq:cron:lock:<name>:<epoch_minute>`.
 -- 3. For each won lock, frames the job into a 64-byte Hybrid Frame and enqueues it
 --    write-through into `MultiPriorityQueue` and Redis working leases.
-executeTick
-  :: [JobSpec]
-  -> RedisSyncHandle
-  -> MultiPriorityQueue
-  -> Metrics
-  -> IORef Word64
-  -> UTCTime
-  -> IO Int
-executeTick executableSpecs redisSync mpq metrics jobIdCounter nowUtc = do
-  let nowEpochSec = realToFrac (utcTimeToPOSIXSeconds nowUtc) :: Double
-      epochMinute = floor (nowEpochSec / 60.0) :: Int
-      dueSpecs    = filter (\s -> matchesTime (jsExpr s) nowUtc) executableSpecs
+executeTick :: UTCTime -> CronM Int
+executeTick nowUtc = do
+  Env {..} <- ask
+  liftIO $ do
+    let nowEpochSec = realToFrac (utcTimeToPOSIXSeconds nowUtc) :: Double
+        epochMinute = floor (nowEpochSec / 60.0) :: Int
+        dueSpecs    = filter (\s -> matchesTime (jsExpr s) nowUtc) ceSpecs
+        tryLock s   = do
+          let lockKey = "wq:cron:lock:" <> TE.encodeUtf8 (jsName s) <> ":" <> B8.pack (show epochMinute)
+          acquireCronLock (rshStore ceRedisSync) lockKey nowEpochSec 90.0
 
-  enqueuedCountRef <- atomicModifyIORef' jobIdCounter (\n -> (n, 0 :: Int))
-  _ <- pure enqueuedCountRef
+    wonSpecs <- filterM tryLock dueSpecs
+    for_ wonSpecs $ \spec -> do
+      jId   <- atomicModifyIORef' ceJobCounter (\n -> (n + 1, n + 1))
+      nowNs <- fromIntegral <$> getMonotonicTimeNSec
+      let prio  = Frame.parsePriority (jsQueue spec)
+          jid24 = formatJid epochMinute jId
+          frame = Frame.encode Frame.Params
+            { fpPriority     = prio
+            , fpSource       = Frame.SourceCron
+            , fpRetryCount   = 0
+            , fpMaxRetries   = jsMaxRetries spec
+            , fpJobId        = jId
+            , fpSidekiqJid   = jid24
+            , fpCreatedAtNs  = nowNs
+            , fpQueueSlice   = jsQueue spec
+            , fpTagSlice     = jsClass spec
+            , fpPayloadSlice = jsArgsBytes spec
+            }
+      for_ (frameToSidekiqJson frame Nothing) (recordWorkingLeaseAsync ceRedisSync jid24)
+      enqueueFrame ceQueue frame
+      incEnqueued ceMetrics 1
+      incCronTriggered ceMetrics
 
-  let go [] !acc = pure acc
-      go (spec:rest) !acc = do
-        let lockKey =
-              "wq:cron:lock:"
-                <> TE.encodeUtf8 (jsName spec)
-                <> ":"
-                <> B8.pack (show epochMinute)
-        wonLock <- acquireCronLock (rshStore redisSync) lockKey nowEpochSec 90.0
-        if not wonLock
-          then go rest acc
-          else do
-            jId   <- atomicModifyIORef' jobIdCounter (\n -> (n + 1, n + 1))
-            nowNs <- fromIntegral <$> getMonotonicTimeNSec
-            let prio  = parseQueuePriority (jsQueue spec)
-                jid24 = formatJid epochMinute jId
-                frame = encodeFrame
-                  prio
-                  SourceCron
-                  0
-                  (jsMaxRetries spec)
-                  jId
-                  jid24
-                  nowNs
-                  (jsQueue spec)
-                  (jsClass spec)
-                  (jsArgsBytes spec)
-            for_ (frameToSidekiqJson frame Nothing) $ \skJson ->
-              recordWorkingLeaseAsync redisSync jid24 skJson
-            enqueueFrame mpq frame
-            incEnqueued metrics 1
-            incCronTriggered metrics
-            go rest (acc + 1)
-
-  go dueSpecs 0
+    pure (length wonSpecs)
 
 formatJid :: Int -> Word64 -> ByteString
 formatJid epochMin jId =

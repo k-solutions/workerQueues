@@ -1,45 +1,52 @@
-{-# LANGUAGE GHC2024 #-}
+{-# LANGUAGE GHC2024           #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE RecordWildCards   #-}
 
+-- | 64-Byte Zero-Copy Frame & Typed `JobPayload` Codec.
+-- Intended to be imported qualified:
+--
+-- @
+-- import WorkerQueue.Frame qualified as Frame
+-- @
 module WorkerQueue.Frame
-  ( -- * Priority & Frame Source
+  ( -- * Priority & Source
     Priority (..)
-  , FrameSource (..)
-  , priorityToQueueName
-  , parseQueuePriority
+  , Source (..)
+  , toQueueName
+  , parsePriority
 
     -- * 64-Byte Zero-Copy Frame Header
-  , frameHeaderSize
-  , frameMagic
-  , frameVersion
-  , JobHeader (..)
-  , encodeFrame
-  , decodeHeaderZeroCopy
-  , bumpFrameRetry
+  , headerSize
+  , magic
+  , version
+  , Params (..)
+  , Header (..)
+  , encode
+  , decodeHeader
+  , bumpRetry
 
     -- * Typed JobPayload Codec
   , JobPayload (..)
-  , encodeJobToFrame
+  , encodeJob
   ) where
 
-import Data.Aeson (FromJSON, ToJSON)
-import Data.Aeson qualified as Aeson
-import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.ByteString (ByteString)
-import Data.ByteString qualified as BS
-import Data.ByteString.Builder (Builder)
-import Data.ByteString.Builder qualified as B
-import Data.ByteString.Internal qualified as BSI
-import Data.ByteString.Lazy qualified as BSL
-import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
-import Data.Word (Word8, Word16, Word32, Word64)
-import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
-import Foreign.Marshal.Utils (copyBytes, fillBytes)
-import Foreign.Ptr (Ptr, plusPtr)
-import Foreign.Storable (peekByteOff, pokeByteOff)
-import System.IO.Unsafe (unsafeDupablePerformIO)
+import           Data.Aeson               (FromJSON, ToJSON)
+import qualified Data.Aeson               as Aeson
+import           Data.Bits                (shiftL, shiftR, (.&.), (.|.))
+import           Data.ByteString          (ByteString)
+import qualified Data.ByteString          as BS
+import           Data.ByteString.Builder  (Builder)
+import qualified Data.ByteString.Builder  as B
+import qualified Data.ByteString.Internal as BSI
+import qualified Data.ByteString.Lazy     as BSL
+import           Data.Int                 (Int64)
+import           Data.Proxy               (Proxy (..))
+import           Data.Word                (Word16, Word32, Word64, Word8)
+import           Foreign.ForeignPtr       (plusForeignPtr, withForeignPtr)
+import           Foreign.Marshal.Utils    (copyBytes, fillBytes)
+import           Foreign.Ptr              (Ptr, plusPtr)
+import           Foreign.Storable         (peekByteOff, pokeByteOff)
+import           System.IO.Unsafe         (unsafeDupablePerformIO)
 
 -- | Queue priority levels matching Sidekiq conventions.
 data Priority
@@ -49,33 +56,33 @@ data Priority
   deriving (Show, Eq, Ord, Enum, Bounded)
 
 -- | Origin of a framed job.
-data FrameSource
+data Source
   = SourceRails
   | SourceCron
   | SourceHaskell
   deriving (Show, Eq, Ord, Enum, Bounded)
 
-priorityToQueueName :: Priority -> ByteString
-priorityToQueueName Critical = "critical"
-priorityToQueueName Default  = "default"
-priorityToQueueName Low      = "low"
-{-# INLINE priorityToQueueName #-}
+toQueueName :: Priority -> ByteString
+toQueueName Critical = "critical"
+toQueueName Default  = "default"
+toQueueName Low      = "low"
+{-# INLINE toQueueName #-}
 
-parseQueuePriority :: ByteString -> Priority
-parseQueuePriority q
+parsePriority :: ByteString -> Priority
+parsePriority q
   | q == "critical" || q == "queue:critical" = Critical
   | q == "low"      || q == "queue:low"      = Low
   | otherwise                                = Default
-{-# INLINE parseQueuePriority #-}
+{-# INLINE parsePriority #-}
 
-encodePrioritySource :: Priority -> FrameSource -> Word8
+encodePrioritySource :: Priority -> Source -> Word8
 encodePrioritySource prio src =
   let pBits = fromIntegral (fromEnum prio) .&. 0x03
       sBits = (fromIntegral (fromEnum src) .&. 0x03) `shiftL` 2
    in pBits .|. sBits
 {-# INLINE encodePrioritySource #-}
 
-decodePrioritySource :: Word8 -> (Priority, FrameSource)
+decodePrioritySource :: Word8 -> (Priority, Source)
 decodePrioritySource w =
   let p = case w .&. 0x03 of
             0 -> Critical
@@ -89,26 +96,40 @@ decodePrioritySource w =
 {-# INLINE decodePrioritySource #-}
 
 -- | Fixed 64-byte (single CPU L1 cache line) binary header size.
-frameHeaderSize :: Int
-frameHeaderSize = 64
-{-# INLINE frameHeaderSize #-}
+headerSize :: Int
+headerSize = 64
+{-# INLINE headerSize #-}
 
 -- | Magic bytes: 0x5751 ("WQ" in ASCII).
-frameMagic :: Word16
-frameMagic = 0x5751
-{-# INLINE frameMagic #-}
+magic :: Word16
+magic = 0x5751
+{-# INLINE magic #-}
 
 -- | Wire format version 1.
-frameVersion :: Word8
-frameVersion = 1
-{-# INLINE frameVersion #-}
+version :: Word8
+version = 1
+{-# INLINE version #-}
+
+-- | Parameters for encoding a 64-byte job frame and its contiguous slices.
+data Params = Params
+  { fpPriority     :: !Priority
+  , fpSource       :: !Source
+  , fpRetryCount   :: !Word16
+  , fpMaxRetries   :: !Word16
+  , fpJobId        :: !Word64
+  , fpSidekiqJid   :: !ByteString -- ^ Sidekiq JID (normalized to 24 bytes)
+  , fpCreatedAtNs  :: !Int64
+  , fpQueueSlice   :: !ByteString
+  , fpTagSlice     :: !ByteString -- ^ Sidekiq `class` name
+  , fpPayloadSlice :: !ByteString -- ^ Raw JSON `args`
+  } deriving (Show, Eq)
 
 -- | Zero-copy decoded view of a 64-byte job frame and its contiguous slices.
-data JobHeader = JobHeader
+data Header = Header
   { hdrMagic        :: !Word16
   , hdrVersion      :: !Word8
   , hdrPriority     :: !Priority
-  , hdrSource       :: !FrameSource
+  , hdrSource       :: !Source
   , hdrRetryCount   :: !Word16
   , hdrMaxRetries   :: !Word16
   , hdrJobId        :: !Word64
@@ -131,45 +152,34 @@ normalizeJid24 jid
 {-# INLINE normalizeJid24 #-}
 
 -- | Construct a contiguous pinned ByteString containing the 64-byte header
--- followed immediately by `queueSlice`, `tagSlice`, and `payloadSlice`.
-encodeFrame
-  :: Priority
-  -> FrameSource
-  -> Word16     -- ^ retryCount
-  -> Word16     -- ^ maxRetries
-  -> Word64     -- ^ jobId
-  -> ByteString -- ^ sidekiqJid (up to 24 bytes)
-  -> Int64      -- ^ createdAtNs
-  -> ByteString -- ^ queueSlice
-  -> ByteString -- ^ tagSlice (Sidekiq class name)
-  -> ByteString -- ^ payloadSlice (raw JSON args)
-  -> ByteString
-encodeFrame prio src retryCnt maxRet jId rawJid createdNs qSlice tSlice pSlice =
-  let jid24   = normalizeJid24 rawJid
-      !qLen   = BS.length qSlice
-      !tLen   = BS.length tSlice
-      !pLen   = BS.length pSlice
-      !totalSz = frameHeaderSize + qLen + tLen + pLen
+-- followed immediately by `fpQueueSlice`, `fpTagSlice`, and `fpPayloadSlice`.
+encode :: Params -> ByteString
+encode Params {..} =
+  let jid24    = normalizeJid24 fpSidekiqJid
+      !qLen    = BS.length fpQueueSlice
+      !tLen    = BS.length fpTagSlice
+      !pLen    = BS.length fpPayloadSlice
+      !totalSz = headerSize + qLen + tLen + pLen
    in BSI.unsafeCreate totalSz $ \ptr -> do
-        fillBytes ptr 0 frameHeaderSize
-        pokeByteOff ptr 0  frameMagic
-        pokeByteOff ptr 2  frameVersion
-        pokeByteOff ptr 3  (encodePrioritySource prio src)
-        pokeByteOff ptr 4  retryCnt
-        pokeByteOff ptr 6  maxRet
-        pokeByteOff ptr 8  jId
+        fillBytes ptr 0 headerSize
+        pokeByteOff ptr 0  magic
+        pokeByteOff ptr 2  version
+        pokeByteOff ptr 3  (encodePrioritySource fpPriority fpSource)
+        pokeByteOff ptr 4  fpRetryCount
+        pokeByteOff ptr 6  fpMaxRetries
+        pokeByteOff ptr 8  fpJobId
         copyBsToPtr jid24  (ptr `plusPtr` 16)
-        pokeByteOff ptr 40 createdNs
+        pokeByteOff ptr 40 fpCreatedAtNs
         pokeByteOff ptr 48 (fromIntegral qLen :: Word32)
         pokeByteOff ptr 52 (fromIntegral tLen :: Word32)
         pokeByteOff ptr 56 (fromIntegral pLen :: Word64)
-        let qPtr = ptr `plusPtr` frameHeaderSize
+        let qPtr = ptr `plusPtr` headerSize
             tPtr = qPtr `plusPtr` qLen
             pPtr = tPtr `plusPtr` tLen
-        copyBsToPtr qSlice qPtr
-        copyBsToPtr tSlice tPtr
-        copyBsToPtr pSlice pPtr
-{-# INLINE encodeFrame #-}
+        copyBsToPtr fpQueueSlice   qPtr
+        copyBsToPtr fpTagSlice     tPtr
+        copyBsToPtr fpPayloadSlice pPtr
+{-# INLINE encode #-}
 
 copyBsToPtr :: ByteString -> Ptr Word8 -> IO ()
 copyBsToPtr (BSI.BS fp len) dst
@@ -180,17 +190,17 @@ copyBsToPtr (BSI.BS fp len) dst
 -- | Decode the 64-byte binary header and extract zero-copy ByteString slices
 -- (`hdrSidekiqJid`, `hdrQueueSlice`, `hdrTagSlice`, `hdrPayloadSlice`)
 -- pointing directly into the same underlying ForeignPtr buffer via `plusForeignPtr`.
-decodeHeaderZeroCopy :: ByteString -> Either String JobHeader
-decodeHeaderZeroCopy (BSI.BS fp totalLen)
-  | totalLen < frameHeaderSize =
+decodeHeader :: ByteString -> Either String Header
+decodeHeader (BSI.BS fp totalLen)
+  | totalLen < headerSize =
       Left $ "Frame too short: " <> show totalLen <> " bytes (expected >= 64)"
   | otherwise = unsafeDupablePerformIO $ withForeignPtr fp $ \ptr -> do
-      magic <- peekByteOff ptr 0 :: IO Word16
-      ver   <- peekByteOff ptr 2 :: IO Word8
-      if magic /= frameMagic
-        then pure $ Left ("Invalid frame magic: " <> show magic)
-        else if ver /= frameVersion
-          then pure $ Left ("Unsupported frame version: " <> show ver)
+      m <- peekByteOff ptr 0 :: IO Word16
+      v <- peekByteOff ptr 2 :: IO Word8
+      if m /= magic
+        then pure $ Left ("Invalid frame magic: " <> show m)
+        else if v /= version
+          then pure $ Left ("Unsupported frame version: " <> show v)
           else do
             psByte    <- peekByteOff ptr 3  :: IO Word8
             retryCnt  <- peekByteOff ptr 4  :: IO Word16
@@ -205,7 +215,7 @@ decodeHeaderZeroCopy (BSI.BS fp totalLen)
                 !qLen         = fromIntegral qLenW32 :: Int
                 !tLen         = fromIntegral tLenW32 :: Int
                 !pLen         = fromIntegral pLenW64 :: Int
-                !tOff         = frameHeaderSize + qLen
+                !tOff         = headerSize + qLen
                 !pOff         = tOff + tLen
                 !expectedLen  = pOff + pLen
 
@@ -214,12 +224,12 @@ decodeHeaderZeroCopy (BSI.BS fp totalLen)
                 "Truncated frame slices: have " <> show totalLen <> ", need " <> show expectedLen
               else do
                 let !jidSlice = BSI.BS (plusForeignPtr fp 16) 24
-                    !qSlice   = BSI.BS (plusForeignPtr fp frameHeaderSize) qLen
+                    !qSlice   = BSI.BS (plusForeignPtr fp headerSize) qLen
                     !tSlice   = BSI.BS (plusForeignPtr fp tOff) tLen
                     !pSlice   = BSI.BS (plusForeignPtr fp pOff) pLen
-                pure $ Right JobHeader
-                  { hdrMagic        = magic
-                  , hdrVersion      = ver
+                pure $ Right Header
+                  { hdrMagic        = m
+                  , hdrVersion      = v
                   , hdrPriority     = prio
                   , hdrSource       = src
                   , hdrRetryCount   = retryCnt
@@ -234,13 +244,13 @@ decodeHeaderZeroCopy (BSI.BS fp totalLen)
                   , hdrTagSlice     = tSlice
                   , hdrPayloadSlice = pSlice
                   }
-{-# INLINE decodeHeaderZeroCopy #-}
+{-# INLINE decodeHeader #-}
 
 -- | Increment `retryCount` at byte offset 4..5 in the 64-byte header.
 -- Returns `Right (newRetryCount, maxRetries, updatedFrame)` or `Left err`.
-bumpFrameRetry :: ByteString -> Either String (Word16, Word16, ByteString)
-bumpFrameRetry (BSI.BS fp totalLen)
-  | totalLen < frameHeaderSize = Left "Frame too short to bump retryCount"
+bumpRetry :: ByteString -> Either String (Word16, Word16, ByteString)
+bumpRetry (BSI.BS fp totalLen)
+  | totalLen < headerSize = Left "Frame too short to bump retryCount"
   | otherwise = unsafeDupablePerformIO $ withForeignPtr fp $ \srcPtr -> do
       curRetry <- peekByteOff srcPtr 4 :: IO Word16
       maxRet   <- peekByteOff srcPtr 6 :: IO Word16
@@ -249,7 +259,7 @@ bumpFrameRetry (BSI.BS fp totalLen)
         copyBytes dstPtr srcPtr totalLen
         pokeByteOff dstPtr 4 nextRetry
       pure $ Right (nextRetry, maxRet, updated)
-{-# INLINE bumpFrameRetry #-}
+{-# INLINE bumpRetry #-}
 
 -- | Core typeclass implemented by typed Haskell worker payloads.
 class (FromJSON a, ToJSON a) => JobPayload a where
@@ -267,19 +277,27 @@ class (FromJSON a, ToJSON a) => JobPayload a where
   {-# INLINE decodePayload #-}
 
 -- | Convenience helper to encode a typed Haskell `JobPayload` directly into a 64-byte frame.
-encodeJobToFrame
+encodeJob
   :: forall a. JobPayload a
   => Priority
-  -> FrameSource
+  -> Source
   -> Word16     -- ^ maxRetries
   -> Word64     -- ^ jobId
   -> ByteString -- ^ sidekiqJid (24 bytes)
   -> Int64      -- ^ createdAtNs
   -> a
   -> ByteString
-encodeJobToFrame prio src maxRet jId jid createdNs payload =
-  let qSlice = priorityToQueueName prio
-      tSlice = jobClassTag (Proxy @a)
-      pSlice = BSL.toStrict (B.toLazyByteString (encodePayload payload))
-   in encodeFrame prio src 0 maxRet jId jid createdNs qSlice tSlice pSlice
-{-# INLINE encodeJobToFrame #-}
+encodeJob prio src maxRet jId jid createdNs payload =
+  encode Params
+    { fpPriority     = prio
+    , fpSource       = src
+    , fpRetryCount   = 0
+    , fpMaxRetries   = maxRet
+    , fpJobId        = jId
+    , fpSidekiqJid   = jid
+    , fpCreatedAtNs  = createdNs
+    , fpQueueSlice   = toQueueName prio
+    , fpTagSlice     = jobClassTag (Proxy @a)
+    , fpPayloadSlice = BSL.toStrict (B.toLazyByteString (encodePayload payload))
+    }
+{-# INLINE encodeJob #-}

@@ -10,6 +10,7 @@ module WorkerQueue.Redis
     -- * Redis / Valkey Store & State Inspection
   , RedisStore (..)
   , ZSetEntry (..)
+  , ClaimBatchParams (..)
   , newRedisStore
   , pushSidekiqQueueJob
   , pushSidekiqScheduledJob
@@ -48,6 +49,7 @@ import Control.Concurrent.STM
   , writeTBQueue
   , writeTVar
   )
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
@@ -158,17 +160,25 @@ pushSidekiqScheduledJob store !runAtSec rawJson =
     ZSetEntry runAtSec rawJson : zs
 {-# INLINE pushSidekiqScheduledJob #-}
 
+-- | Parameters for `claimExecutableBatch`.
+data ClaimBatchParams = ClaimBatchParams
+  { cbpStore          :: !RedisStore
+  , cbpMetrics        :: !Metrics
+  , cbpAllowedClasses :: !(HashSet ByteString) -- ^ `registeredClasses` from `Dispatcher`
+  , cbpQueueName      :: !ByteString           -- ^ Queue name (e.g. "critical", "default", "low")
+  , cbpMaxClaim       :: !Int                  -- ^ Max batch size to claim
+  }
+
 -- | Execute capability-aware atomic batch claim on `queue:<name>`.
 -- Only pops jobs whose `wrapped` or `class` is in `registeredClasses`.
 -- Non-matching (e.g. Ruby Sidekiq) jobs remain untouched in FIFO order!
-claimExecutableBatch
-  :: RedisStore
-  -> Metrics
-  -> HashSet ByteString -- ^ `registeredClasses` from `Dispatcher`
-  -> ByteString         -- ^ Queue name (e.g. "critical", "default", "low")
-  -> Int                -- ^ Max batch size to claim
-  -> IO [ByteString]
-claimExecutableBatch store metrics allowedClasses queueName !maxClaim = do
+claimExecutableBatch :: ClaimBatchParams -> IO [ByteString]
+claimExecutableBatch !params = do
+  let store          = cbpStore params
+      metrics        = cbpMetrics params
+      allowedClasses = cbpAllowedClasses params
+      queueName      = cbpQueueName params
+      !maxClaim      = cbpMaxClaim params
   (claimed, skippedCount) <- atomically $ do
     qm <- readTVar (rsQueues store)
     let QueueState prevAllowed prevSkip qSeq = HM.lookupDefault emptyQueueState queueName qm
@@ -177,20 +187,25 @@ claimExecutableBatch store metrics allowedClasses queueName !maxClaim = do
         (matched, keptSuffix, newlySkipped) = scanQueueFIFO allowedClasses maxClaim toScanSeq
         !totalSkippedPrefix = startSkip + newlySkipped
         !remaining = alreadySkippedSeq <> keptSuffix
-    if null matched && newlySkipped == 0 && prevAllowed == allowedClasses
-      then pure ([], 0)
-      else do
-        writeTVar (rsQueues store) $!
-          HM.insert queueName (QueueState allowedClasses totalSkippedPrefix remaining) qm
-        if null matched
-          then pure ([], newlySkipped)
-          else do
-            modifyTVar' (rsWorking store) $ \wm ->
-              foldl' (\acc raw -> HM.insert (extractJidKey raw) raw acc) wm matched
-            pure (matched, newlySkipped)
-  if skippedCount > 0
-    then incRubySkipped metrics (fromIntegral skippedCount)
-    else pure ()
+        commitQueueState =
+          writeTVar (rsQueues store) $!
+            HM.insert queueName (QueueState allowedClasses totalSkippedPrefix remaining) qm
+        commitWorkingLeases =
+          modifyTVar' (rsWorking store) $ \wm ->
+            foldl' (\acc raw -> HM.insert (extractJidKey raw) raw acc) wm matched
+        applyClaim
+          | null matched && newlySkipped == 0 && prevAllowed == allowedClasses =
+              pure ([], 0)
+          | null matched = do
+              commitQueueState
+              pure ([], newlySkipped)
+          | otherwise = do
+              commitQueueState
+              commitWorkingLeases
+              pure (matched, newlySkipped)
+    applyClaim
+  when (skippedCount > 0) $
+    incRubySkipped metrics (fromIntegral skippedCount)
   pure claimed
 {-# INLINE claimExecutableBatch #-}
 
@@ -218,12 +233,10 @@ scanQueueFIFO allowed !maxClaim = go [] 0 Seq.empty 0
 extractJidKey :: ByteString -> ByteString
 extractJidKey raw =
   case scanSidekiqJidFast raw of
-    Just jid ->
-      if BS.length jid == 24
-        then jid
-        else if BS.length jid > 24
-          then BS.take 24 jid
-          else jid <> BS.replicate (24 - BS.length jid) 0x30
+    Just jid
+      | BS.length jid == 24 -> jid
+      | BS.length jid > 24  -> BS.take 24 jid
+      | otherwise           -> jid <> BS.replicate (24 - BS.length jid) 0x30
     Nothing -> raw
 {-# INLINE extractJidKey #-}
 

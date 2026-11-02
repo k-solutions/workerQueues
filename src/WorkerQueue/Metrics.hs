@@ -30,6 +30,7 @@ module WorkerQueue.Metrics
   ) where
 
 import Control.Concurrent.MVar (newMVar, withMVar)
+import Control.Monad (when)
 import Data.Int (Int64)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
@@ -49,18 +50,19 @@ newtype Logger = Logger
   { runLogger :: LogLevel -> Text -> IO ()
   }
 
+logLevelPrefix :: LogLevel -> Text
+logLevelPrefix LevelInfo  = "[INFO]  "
+logLevelPrefix LevelWarn  = "[WARN]  "
+logLevelPrefix LevelError = "[ERROR] "
+{-# INLINE logLevelPrefix #-}
+
 newStderrLogger :: LogLevel -> IO Logger
 newStderrLogger minLevel = do
   lock <- newMVar ()
   pure $ Logger $ \lvl msg ->
-    if lvl >= minLevel
-      then withMVar lock $ \() ->
-        let prefix = case lvl of
-              LevelInfo  -> "[INFO]  "
-              LevelWarn  -> "[WARN]  "
-              LevelError -> "[ERROR] "
-         in TIO.hPutStrLn stderr (prefix <> msg)
-      else pure ()
+    when (lvl >= minLevel) $
+      withMVar lock $ \() ->
+        TIO.hPutStrLn stderr (logLevelPrefix lvl <> msg)
 
 newSilentLogger :: Logger
 newSilentLogger = Logger $ \_ _ -> pure ()

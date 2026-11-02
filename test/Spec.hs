@@ -26,6 +26,7 @@ import Test.Tasty.HUnit (assertBool, assertEqual, testCase, (@?=))
 import Test.Tasty.QuickCheck as QC
 import WorkerQueue
 import WorkerQueue.Cron qualified as Cron
+import WorkerQueue.Frame qualified as Frame
 
 --------------------------------------------------------------------------------
 -- Sample Domain Payload Types for Testing
@@ -79,12 +80,23 @@ frameSpecs = testGroup "WorkerQueue.Frame (64-Byte Cache-Line Header & Zero-Copy
           qName = "critical"
           tag   = "InvoiceSettlementWorker"
           body  = "{\"invId\":98124,\"invCurrency\":\"EUR\"}"
-          raw   = encodeFrame Critical SourceRails 2 25 777 jid 1_700_000_000_000 qName tag body
+          raw   = Frame.encode Frame.Params
+            { fpPriority     = Critical
+            , fpSource       = SourceRails
+            , fpRetryCount   = 2
+            , fpMaxRetries   = 25
+            , fpJobId        = 777
+            , fpSidekiqJid   = jid
+            , fpCreatedAtNs  = 1_700_000_000_000
+            , fpQueueSlice   = qName
+            , fpTagSlice     = tag
+            , fpPayloadSlice = body
+            }
 
       BS.length raw @?= 64 + BS.length qName + BS.length tag + BS.length body
 
-      case decodeHeaderZeroCopy raw of
-        Left err  -> fail ("decodeHeaderZeroCopy failed: " <> err)
+      case Frame.decodeHeader raw of
+        Left err  -> fail ("Frame.decodeHeader failed: " <> err)
         Right hdr -> do
           hdrMagic hdr        @?= 0x5751
           hdrVersion hdr      @?= 1
@@ -100,15 +112,15 @@ frameSpecs = testGroup "WorkerQueue.Frame (64-Byte Cache-Line Header & Zero-Copy
           hdrPayloadSlice hdr @?= body
           decodePayload (hdrPayloadSlice hdr) @?= Right (SampleInvoice 98124 "EUR")
 
-  , testCase "bumpFrameRetry increments retryCount at offset 4..5 without altering slices" $ do
+  , testCase "bumpRetry increments retryCount at offset 4..5 without altering slices" $ do
       let jid  = "111122223333444455556666"
-          raw0 = encodeJobToFrame Default SourceHaskell 10 42 jid 999_000 (SampleInvoice 55 "USD")
-      case bumpFrameRetry raw0 of
+          raw0 = Frame.encodeJob Default SourceHaskell 10 42 jid 999_000 (SampleInvoice 55 "USD")
+      case Frame.bumpRetry raw0 of
         Left err -> fail err
         Right (r1, maxR, raw1) -> do
           r1   @?= 1
           maxR @?= 10
-          case decodeHeaderZeroCopy raw1 of
+          case Frame.decodeHeader raw1 of
             Left err  -> fail err
             Right hdr -> do
               hdrRetryCount hdr @?= 1
@@ -119,11 +131,11 @@ frameSpecs = testGroup "WorkerQueue.Frame (64-Byte Cache-Line Header & Zero-Copy
 
   , testCase "rejects frames shorter than 64 bytes or with invalid magic" $ do
       assertBool "short frame rejected" $
-        case decodeHeaderZeroCopy "short" of
+        case Frame.decodeHeader "short" of
           Left _  -> True
           Right _ -> False
       assertBool "bad magic rejected" $
-        case decodeHeaderZeroCopy (BS.replicate 64 0xFF) of
+        case Frame.decodeHeader (BS.replicate 64 0xFF) of
           Left _  -> True
           Right _ -> False
 
@@ -135,8 +147,19 @@ frameSpecs = testGroup "WorkerQueue.Frame (64-Byte Cache-Line Header & Zero-Copy
             tSlice = BS.pack tBytes
             pSlice = BS.pack pBytes
             jid    = "abcdef0123456789abcdef01"
-            frame  = encodeFrame prio src rCnt maxR jId jid ts qSlice tSlice pSlice
-         in case decodeHeaderZeroCopy frame of
+            frame  = Frame.encode Frame.Params
+              { fpPriority     = prio
+              , fpSource       = src
+              , fpRetryCount   = rCnt
+              , fpMaxRetries   = maxR
+              , fpJobId        = jId
+              , fpSidekiqJid   = jid
+              , fpCreatedAtNs  = ts
+              , fpQueueSlice   = qSlice
+              , fpTagSlice     = tSlice
+              , fpPayloadSlice = pSlice
+              }
+         in case Frame.decodeHeader frame of
               Left _    -> False
               Right hdr ->
                 hdrPriority hdr     == prio
@@ -202,7 +225,7 @@ sidekiqSpecs = testGroup "WorkerQueue.Sidekiq (Rails Sidekiq::Client & ActiveJob
       case sidekiqEnvelopeToFrame 101 500_000 rawJson of
         Left err    -> fail err
         Right frame ->
-          case decodeHeaderZeroCopy frame of
+          case Frame.decodeHeader frame of
             Left err  -> fail err
             Right hdr -> do
               hdrPriority hdr   @?= Critical
@@ -224,7 +247,7 @@ sidekiqSpecs = testGroup "WorkerQueue.Sidekiq (Rails Sidekiq::Client & ActiveJob
       case sidekiqEnvelopeToFrame 102 600_000 activeJobJson of
         Left err    -> fail err
         Right frame ->
-          case decodeHeaderZeroCopy frame of
+          case Frame.decodeHeader frame of
             Left err  -> fail err
             Right hdr -> do
               hdrTagSlice hdr @?= "InvoiceSettlementWorker"
@@ -267,7 +290,13 @@ redisCapabilitySpecs = testGroup "WorkerQueue.Redis (Capability-Aware Filtering 
       pushSidekiqQueueJob store "default" rubyJob2
       pushSidekiqQueueJob store "default" hsJob2
 
-      claimed <- claimExecutableBatch store metrics allowed "default" 10
+      claimed <- claimExecutableBatch ClaimBatchParams
+        { cbpStore          = store
+        , cbpMetrics        = metrics
+        , cbpAllowedClasses = allowed
+        , cbpQueueName      = "default"
+        , cbpMaxClaim       = 10
+        }
       claimed @?= [hsJob1, hsJob2]
 
       -- Verify both Ruby jobs are still untouched in the queue in exact FIFO order!
@@ -303,16 +332,16 @@ redisCapabilitySpecs = testGroup "WorkerQueue.Redis (Capability-Aware Filtering 
 cronSpecs :: TestTree
 cronSpecs = testGroup "WorkerQueue.Cron (YAML Schedule Parser, Capability Filter & NX Lock)"
   [ testCase "evaluates 5-field cron expressions accurately" $ do
-      Right exprNightly <- pure (parseCronExpr "0 2 * * *")
-      Right exprEvery15 <- pure (parseCronExpr "*/15 * * * *")
+      Right exprNightly <- pure (Cron.parseExpr "0 2 * * *")
+      Right exprEvery15 <- pure (Cron.parseExpr "*/15 * * * *")
 
       let t0200 = UTCTime (fromGregorian 2026 11 1) (secondsToDiffTime (2 * 3600))
           t0215 = UTCTime (fromGregorian 2026 11 1) (secondsToDiffTime (2 * 3600 + 15 * 60))
 
-      matchesCronTime exprNightly t0200 @?= True
-      matchesCronTime exprNightly t0215 @?= False
-      matchesCronTime exprEvery15 t0200 @?= True
-      matchesCronTime exprEvery15 t0215 @?= True
+      Cron.matchesTime exprNightly t0200 @?= True
+      Cron.matchesTime exprNightly t0215 @?= False
+      Cron.matchesTime exprEvery15 t0200 @?= True
+      Cron.matchesTime exprEvery15 t0215 @?= True
 
   , testCase "validates YAML cron capabilities and deduplicates across worker nodes via Redis NX lock" $ do
       let yamlBs =
@@ -328,9 +357,9 @@ cronSpecs = testGroup "WorkerQueue.Cron (YAML Schedule Parser, Capability Filter
             \    cron: \"* * * * *\"\n\
             \    class: \"UnregisteredRubyWorker\"\n\
             \    queue: \"default\"\n"
-      Right sched <- pure (parseCronScheduleYaml yamlBs)
+      Right sched <- pure (Cron.parseScheduleYaml yamlBs)
       let allowed = HS.fromList ["StaleSessionCleanupWorker"]
-          (execSpecs, skipped) = validateCronCapabilities allowed sched
+          (execSpecs, skipped) = Cron.validateCapabilities allowed sched
 
       length execSpecs @?= 1
       skipped          @?= ["ruby_job"]
@@ -341,9 +370,10 @@ cronSpecs = testGroup "WorkerQueue.Cron (YAML Schedule Parser, Capability Filter
       metrics <- newMetrics
       jCnt    <- newIORef 0
       let tickTime = UTCTime (fromGregorian 2026 11 1) (secondsToDiffTime (2 * 3600 + 15 * 60))
+          cronEnv  = Cron.Env execSpecs syncHdl mpq metrics jCnt
 
-      c1 <- executeCronTick execSpecs syncHdl mpq metrics jCnt tickTime
-      c2 <- executeCronTick execSpecs syncHdl mpq metrics jCnt tickTime
+      c1 <- Cron.runCronM cronEnv (Cron.executeTick tickTime)
+      c2 <- Cron.runCronM cronEnv (Cron.executeTick tickTime)
       stopRedisSyncEngine syncHdl
 
       c1 @?= 1
@@ -433,10 +463,19 @@ workerMonadAndEngineSpecs = testGroup "WorkerQueue.Worker (`WorkerM ctx` ReaderT
       let rawJson = encodeSidekiqJobJson Critical "spec_jid_000000000000001" 3 1000 (SampleInvoice 42 "CHF")
       pushSidekiqQueueJob store "critical" rawJson
 
-      let cfg = defaultEngineConfig { cfgWorkerCount = 2, cfgPollIntervalMicros = 1_000 }
-      withWorkerEngine cfg store pools newSilentLogger metrics ctx disp $ \hdl -> do
-        threadDelay 30_000
-        flushRedisSyncNow (envRedisSync (wehEnv hdl))
+      let cfg    = defaultEngineConfig { cfgWorkerCount = 2, cfgPollIntervalMicros = 1_000 }
+          params = EngineParams
+            { epConfig     = cfg
+            , epRedisStore = store
+            , epDbPools    = pools
+            , epLogger     = newSilentLogger
+            , epMetrics    = metrics
+            , epAppContext = ctx
+            , epDispatcher = disp
+            }
+      withWorkerEngine params $ do
+        liftIO (threadDelay 30_000)
+        flushEngineRedisSync
 
       finalCount <- readIORef counter
       leases     <- getWorkingLeases store
@@ -455,9 +494,9 @@ workerMonadAndEngineSpecs = testGroup "WorkerQueue.Worker (`WorkerM ctx` ReaderT
           disp = newDispatcher [registerWorker failingHandler]
 
       -- Job 1: maxRetries = 2 (should go to `retry` ZSET on first failure)
-      let frameRetry = encodeJobToFrame Default SourceRails 2 1 "retry_jid_00000000000001" 1000 (SampleCleanup 7)
+      let frameRetry = Frame.encodeJob Default SourceRails 2 1 "retry_jid_00000000000001" 1000 (SampleCleanup 7)
       -- Job 2: maxRetries = 0 (should go directly to `dead` DLQ ZSET on first failure)
-      let frameDlq   = encodeJobToFrame Default SourceRails 0 2 "dlq_jid_0000000000000001" 1000 (SampleCleanup 7)
+      let frameDlq   = Frame.encodeJob Default SourceRails 0 2 "dlq_jid_0000000000000001" 1000 (SampleCleanup 7)
 
       tm        <- startTimeoutManager 5.0 1.0 100_000
       redisSync <- startRedisSyncEngine store
@@ -474,9 +513,10 @@ workerMonadAndEngineSpecs = testGroup "WorkerQueue.Worker (`WorkerM ctx` ReaderT
             , envAppContext = ctx
             }
 
-      processFrameWithTimeout env disp frameRetry
-      processFrameWithTimeout env disp frameDlq
-      flushRedisSyncNow redisSync
+      runEngineM (EngineEnv env disp) $ do
+        processFrameWithTimeout frameRetry
+        processFrameWithTimeout frameDlq
+        flushEngineRedisSync
       stopTimeoutManager tm
       stopRedisSyncEngine redisSync
 

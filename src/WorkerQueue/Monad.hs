@@ -42,7 +42,7 @@ import WorkerQueue.Database
   , withPostgresConn
   , withSqliteConn
   )
-import WorkerQueue.Frame (JobHeader)
+import WorkerQueue.Frame (Header)
 import WorkerQueue.Metrics
   ( Logger
   , Metrics
@@ -76,7 +76,7 @@ data WorkerEnv ctx = WorkerEnv
 data JobContext ctx = JobContext
   { jcEnv    :: !(WorkerEnv ctx)
   , jcTicket :: !JobTicket
-  , jcHeader :: !JobHeader
+  , jcHeader :: !Header
   }
 
 -- | Zero-cost `newtype` over `ReaderT (JobContext ctx) IO`.
@@ -112,7 +112,7 @@ getWorkerEnv :: WorkerM ctx (WorkerEnv ctx)
 getWorkerEnv = asks jcEnv
 {-# INLINE getWorkerEnv #-}
 
-getJobHeader :: WorkerM ctx JobHeader
+getJobHeader :: WorkerM ctx Header
 getJobHeader = asks jcHeader
 {-# INLINE getJobHeader #-}
 

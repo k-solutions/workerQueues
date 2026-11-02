@@ -103,50 +103,48 @@ timeoutManagerLoop mgr = go
       sweepAndSwap mgr
       go
 
+-- | Parameters for a single two-stage timeout sweep pass.
+data SweepContext = SweepContext
+  { scMgr        :: !TimeoutManager
+  , scNowSec     :: !Double
+  , scSoftCutoff :: !Double
+  , scHardCutoff :: !Double
+  , scZeroGrace  :: !Bool
+  }
+
 -- | Swap-and-Merge Core Algorithm (Upgraded with Two-Stage Soft/Hard Expiration)
 sweepAndSwap :: TimeoutManager -> IO ()
 sweepAndSwap mgr = do
   !nowSec <- getMonotonicTime
-  let !softCutoff = nowSec - leaseTimeoutSeconds mgr
-      !hardCutoff = nowSec - gracePeriodSeconds mgr
-      !zeroGrace  = gracePeriodSeconds mgr <= 0
+  let !ctx = SweepContext
+        { scMgr        = mgr
+        , scNowSec     = nowSec
+        , scSoftCutoff = nowSec - leaseTimeoutSeconds mgr
+        , scHardCutoff = nowSec - gracePeriodSeconds mgr
+        , scZeroGrace  = gracePeriodSeconds mgr <= 0
+        }
 
   -- Step 1: Inspect tickets in refOld
   oldTickets  <- readIORef (refOld mgr)
-  survivedOld <- processTickets mgr nowSec softCutoff hardCutoff zeroGrace oldTickets
+  survivedOld <- processTickets ctx oldTickets
 
   -- Step 2: Atomically drain refActive
   newActive   <- atomicModifyIORef' (refActive mgr) ([],)
 
   -- Step 3: Process newActive and merge survivors into refOld
-  survivedNew <- processTickets mgr nowSec softCutoff hardCutoff zeroGrace newActive
+  survivedNew <- processTickets ctx newActive
   writeIORef (refOld mgr) (survivedNew ++ survivedOld)
 
-processTickets
-  :: TimeoutManager
-  -> Double
-  -> Double
-  -> Double
-  -> Bool
-  -> [TicketNode]
-  -> IO [TicketNode]
-processTickets mgr nowSec softCutoff hardCutoff zeroGrace nodes = go nodes []
+processTickets :: SweepContext -> [TicketNode] -> IO [TicketNode]
+processTickets !ctx nodes = go nodes []
   where
     go [] acc = pure acc
     go (node:rest) acc = do
-      acc' <- processTicket mgr nowSec softCutoff hardCutoff zeroGrace node acc
+      acc' <- processTicket ctx node acc
       go rest acc'
 
-processTicket
-  :: TimeoutManager
-  -> Double
-  -> Double
-  -> Double
-  -> Bool
-  -> TicketNode
-  -> [TicketNode]
-  -> IO [TicketNode]
-processTicket mgr nowSec softCutoff hardCutoff zeroGrace node acc = do
+processTicket :: SweepContext -> TicketNode -> [TicketNode] -> IO [TicketNode]
+processTicket !ctx node acc = do
   let t = nodeTicket node
   readIORef (ticketState t) >>= \case
     Completed ->
@@ -156,22 +154,20 @@ processTicket mgr nowSec softCutoff hardCutoff zeroGrace node acc = do
       pure acc
 
     Active lastHeartbeat
-      | lastHeartbeat < softCutoff ->
-          if zeroGrace
-            then do
-              triggerHardKill mgr t
-              pure acc
-            else do
-              -- Stage 1: Transition to SoftExpired and retain for grace period
-              writeIORef (ticketState t) (SoftExpired nowSec)
-              pure (node : acc)
+      | lastHeartbeat < scSoftCutoff ctx && scZeroGrace ctx -> do
+          triggerHardKill (scMgr ctx) t
+          pure acc
+      | lastHeartbeat < scSoftCutoff ctx -> do
+          -- Stage 1: Transition to SoftExpired and retain for grace period
+          writeIORef (ticketState t) (SoftExpired (scNowSec ctx))
+          pure (node : acc)
       | otherwise ->
           pure (node : acc)
 
     SoftExpired softExpAt
-      | softExpAt <= hardCutoff -> do
+      | softExpAt <= scHardCutoff ctx -> do
           -- Stage 2: Grace period elapsed! Hard-kill worker thread & trigger retry/DLQ
-          triggerHardKill mgr t
+          triggerHardKill (scMgr ctx) t
           pure acc
       | otherwise ->
           pure (node : acc)

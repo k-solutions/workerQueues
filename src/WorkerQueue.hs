@@ -1,18 +1,21 @@
 {-# LANGUAGE GHC2024 #-}
 
 module WorkerQueue
-  ( -- * Zero-Copy 64-Byte Frame & Typed `JobPayload` Codec
+  ( -- * Zero-Copy 64-Byte Frame & Typed `JobPayload` Codec (`WorkerQueue.Frame`)
     Priority (..)
-  , FrameSource (..)
-  , priorityToQueueName
-  , parseQueuePriority
-  , frameHeaderSize
-  , JobHeader (..)
-  , encodeFrame
-  , decodeHeaderZeroCopy
-  , bumpFrameRetry
+  , Source (..)
+  , toQueueName
+  , parsePriority
+  , headerSize
+  , magic
+  , version
+  , Params (..)
+  , Header (..)
+  , encode
+  , decodeHeader
+  , bumpRetry
   , JobPayload (..)
-  , encodeJobToFrame
+  , encodeJob
 
     -- * `WorkerM ctx` (`ReaderT (JobContext ctx) IO`) & Combinators
   , WorkerEnv (..)
@@ -97,6 +100,7 @@ module WorkerQueue
   , promoteExecutableZSetLua
   , RedisStore (..)
   , ZSetEntry (..)
+  , ClaimBatchParams (..)
   , newRedisStore
   , pushSidekiqQueueJob
   , pushSidekiqScheduledJob
@@ -122,6 +126,9 @@ module WorkerQueue
   , Expr (..)
   , JobSpec (..)
   , ScheduleFile (..)
+  , CronM
+  , runCronM
+  , fromWorkerEnv
   , parseExpr
   , matchesTime
   , parseScheduleYaml
@@ -155,10 +162,19 @@ module WorkerQueue
   , snapshotMetrics
   , computeLatencySummary
 
-    -- * Worker Engine Lifecycle
+    -- * Worker Engine Lifecycle (`WorkerQueue.Engine`)
   , EngineConfig (..)
   , defaultEngineConfig
+  , EngineParams (..)
+  , EngineEnv (..)
+  , EngineM
+  , runEngineM
+  , askWorkerEnv
+  , askDispatcher
+  , flushEngineRedisSync
   , WorkerEngineHandle (..)
+  , claimRawRedisBatch
+  , ingestRawSidekiqBatch
   , fetchAndIngestRedisBatch
   , processFrameWithTimeout
   , handleRetryOrDLQ
